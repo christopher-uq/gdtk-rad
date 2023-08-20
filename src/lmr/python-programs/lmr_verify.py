@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # A small program to perform a verification test for lmr5.
 #
 # The verification test involves running the same calculation
@@ -6,15 +6,14 @@
 # the preparation, running and results assembly for a 
 # sequence of grids of various refinment levels.
 #
-# Usage:
-# $ python verify.py --norms="rho,vel.x" --number-cells="8,16,32"
-#
 # Output:
 #    Goes in subdirectory case-[<number>|<tag>]
 #
 # Author: Rowan J. Gollan
-# Date: 2023-08-15
+# Date: 2023-07-15
 #
+# History: 2023-08-19
+#          Re-work into a program that can be used in any directory
 
 import click
 import yaml
@@ -23,21 +22,11 @@ import subprocess
 import shutil
 from math import log
 
-domain_length = 1.0
-simFiles = ['job.lua',
-            'constants.txt',
-            'very-viscous-air.lua',
-            'analytic_solution.py',
-            'udf-source-terms.lua',
-            'udf-bc.lua',
-            'ref-soln.lua',
-            'fill-fn.lua']
-
-commonDir = 'common-files'
+filesToCopyFilename = "FILES_TO_COPY"
 
 @click.command()
 @click.option("-cf", "--case-file", "caseFile",
-              default="verification-cases.yml",
+              default="cases.yml",
               help="YAML file with verification cases.",
               show_default=True)
 @click.option("-cn", "--case-number", "caseNumber", type=int,
@@ -56,26 +45,48 @@ If supplied, this is used in preference to a supplied case-number.
               default="rho",
               help="Error norms for calculation as comma-separated list.",
               show_default=True)
-@click.option("-nc", "--number-cells", 'number_cells',
-              default="8,16,32",
+@click.option("-glf", "--grid-level-file", 'gridLevelFile',
+              default="grid-levels.py",
               show_default=True,
               help="""
 \b
-List of number of cells for the various levels of grid refinement.
-A single integer is provided for each grid because discretisation
-is assumed to be equal in the x- and y-directions.
-The values are sorted smallest to largest and grids are processed
-in that sorted order.
+A python file to define the various levels of grid refinement.
+At end of execution of the python file, a list of dictionaries
+called 'gridLevels' is expected to be configured.
 """
               )
-def verify(caseFile, caseNumber, caseTag, normsStr, number_cells):
+@click.option("-gl", "--grid-levels", 'levelsToExec',
+              default="-1",
+              show_default=True,
+              help="""
+\b
+A comma-separated list of grid levels to include in the verification.
+For example, to process grid levels k=[0,1,2], use
+   --grid-levels="0,1,2"
+The value of "-1" (default) indicated to process *all* grid levels
+set in the grid levels file.
+"""
+              )
+@click.option("-cd", "--common-dir", "commonDir",
+              default="common",
+              show_default=True,
+              help="""
+\b
+The name of the directory containing files that are common to all runs
+of the verification. Inside this directory a file called FILES_TO_COPY
+is expected. This file is plain text with one filename per line.
+The filenames listed in FILES_TO_COPY are used in all case directories
+for the verification runs.
+"""
+              )
+def verify(caseFile, caseNumber, caseTag, normsStr, gridLevelFile, levelsToExec, commonDir):
     """Run a verification test.
 
     \b
-    Example for grids 8x8, 16x16, 32x32 with density and temperature norms:
-       > python verify.py --norms="rho,T" --number-cells="8,16,32"
-    Example for norms of density and velocities on 16x16, 32x32, 64x64:
-       > python verify.py --norms="rho,vel.x,vel.y" -nc 16,32,64
+    Example for grid levels 2, 1 and 0 with density and temperature norms:
+       > lmr-verify --grid-levels="0,1,2" --norms="rho,T"
+    Example for norms of density and velocities for case with tag 'ausmdv-2nd-order':
+       > lmr-verify --norms="rho,vel.x,vel.y" -ct ausmdv-2nd-order
 
     """
     # 0. Prepare command-line options
@@ -84,19 +95,29 @@ def verify(caseFile, caseNumber, caseTag, normsStr, number_cells):
         print("No case to process found. Exiting.")
         exit(1)
     
-    ncellsList = [int(ncell) for ncell in number_cells.split(",")]
-    ncellsList.sort()
+    levelsToExec = [int(lvl) for lvl in levelsToExec.split(",")]
+    levelsToExec.sort(reverse=True)
     norms = normsStr.split(",")
     norms = [norm.strip() for norm in norms]
 
+    # 1. Prepare gridLevels and simFiles
+    exec(open(gridLevelFile).read(), globals())
+    simFiles = assembleSimFiles(commonDir)
+    if len(levelsToExec) == 1 and levelsToExec[0] == -1:
+        levelsToExec = list(reversed(range(len(gridLevels))))
+
     # 1. Execute verification runs
-    prepareGridLevels(case, ncellsList)
-    runGridLevels(case, ncellsList)
+    prepareGridLevels(case, gridLevels, levelsToExec, commonDir, simFiles)
+    runGridLevels(case, levelsToExec)
 
     # 2. Post-process results
-    computeNorms(case, ncellsList, normsStr)
-    assembleResults(case, ncellsList, norms)
+    computeNorms(case, levelsToExec, normsStr)
+    assembleResults(case, gridLevels, levelsToExec, norms)
 
+def assembleSimFiles(commonDir):
+    with open(commonDir + "/" + filesToCopyFilename, "r") as f:
+        simFiles = [line.strip() for line in f.readlines() if line != ""]
+    return simFiles
 
 
 def findCase(caseFile, caseNumber, caseTag):
@@ -129,20 +150,17 @@ def findCaseByNumber(caseFile, caseNumber):
             print(f"Number of cases found is: {len(docs)} (cases count from 0)")
             return None
 
-
-def prepareGridLevels(case, ncellsList):
+def prepareGridLevels(case, gridLevels, levelsToExec, commonDir, simFiles):
     print("Preparing cases.")
     cwd = os.getcwd()
-    ngrids = len(ncellsList)
     caseDir = "case-" + case["label"]
-    for i, ncells in enumerate(ncellsList):
-        k = ngrids - i
+    for k in levelsToExec:
         subDir = caseDir + f"/k-{k}"
-        print(f"-- Grid level {k=}: {ncells}x{ncells}")
+        print(f"-- Grid level {k=}")
         os.makedirs(subDir, exist_ok=True)
         os.chdir(subDir)
         with open("config.txt", "w") as f:
-            f.write(buildConfigStr(case, ncells))
+            f.write(buildConfigStr(case, gridLevels[k]))
         with open("run.sh", "w") as f:
             f.write(buildRunStr())
         for f in simFiles:
@@ -150,12 +168,13 @@ def prepareGridLevels(case, ncellsList):
             shutil.copy(fname, ".")
         os.chdir(cwd)
 
-
-def buildConfigStr(case, ncells):
+def buildConfigStr(case, grid):
     cfgStr = ""
-    for param in case.keys():
-        cfgStr += f"{param} = {case[param]!r}\n"
-    cfgStr += f"ncells = {ncells}\n"
+    for param, value in case.items():
+        cfgStr += f"{param} = {value!r}\n"
+    for param, value in grid.items():
+        if param == "dx": continue
+        cfgStr += f"{param} = {value!r}\n"
     return cfgStr
 
 def buildRunStr():
@@ -165,14 +184,12 @@ def buildRunStr():
         f"lmr run-steady\n"
         )
 
-def runGridLevels(case, ncellsList):
+def runGridLevels(case, levelsToExec):
     print("Running simulations with manufactured solution source terms.")
     cwd = os.getcwd()
-    ngrids = len(ncellsList)
     caseDir = "case-" + case["label"]
-    for i, ncells in enumerate(ncellsList):
-        k = ngrids - i
-        print(f"-- Grid level {k=}: {ncells}x{ncells}")
+    for k in levelsToExec:
+        print(f"-- Grid level {k=}")
         subDir = caseDir + f"/k-{k}"
         os.chdir(subDir)
         cmd = "sh run.sh"
@@ -192,14 +209,12 @@ def checkRun(proc):
         return False
     return True
 
-def computeNorms(case, ncellsList, normsStr):
+def computeNorms(case, levelsToExec, normsStr):
     print("Computing norms.")
     cwd = os.getcwd()
-    ngrids = len(ncellsList)
     caseDir = "case-" + case["label"]
-    for i, ncells in enumerate(ncellsList):
-        k = ngrids - i
-        print(f"-- Grid level {k=}: {ncells}x{ncells}")
+    for k in levelsToExec:
+        print(f"-- Grid level {k=}")
         subDir = caseDir + f"/k-{k}"
         os.chdir(subDir)
         cmd = f"lmr compute-norms -f -n {normsStr} -r ref-soln.lua -o ../error-norms-k-{k}.txt"
@@ -208,10 +223,9 @@ def computeNorms(case, ncellsList, normsStr):
         os.chdir(cwd)
     return
 
-def assembleResults(case, ncellsList, norms):
+def assembleResults(case, gridLevels, levelsToExec, norms):
     print("Assembling output files.")
     L1 = {}; L2 = {}; Linf = {}; dx = {}
-    ngrids = len(ncellsList)
     caseDir = "case-" + case["label"]
     f = open(f"{caseDir}/error-norms-{caseDir}.dat", "w")
     header = "# dx "
@@ -219,13 +233,12 @@ def assembleResults(case, ncellsList, norms):
         header += f"L1-{norm}  L2-{norm}  Linf-{norm} "
     header += "\n"
     f.write(header)
-    for i, ncells in enumerate(ncellsList):
-        k = ngrids - i
+    for k in levelsToExec:
         fname = f"{caseDir}/error-norms-k-{k}.txt"
         with open(fname, "r") as file:
             doc = yaml.safe_load(file)
         L1[k] = {}; L2[k] = {}; Linf[k] = {};
-        dx[k] = domain_length/ncells
+        dx[k] = gridLevels[k]['dx']
         row = f"{dx[k]:20.12e} "
         for norm in norms:
             L1[k][norm] = doc[norm]["L1"]
@@ -236,10 +249,10 @@ def assembleResults(case, ncellsList, norms):
         f.write(row)
     f.close()
     # Observed order calculation
-    if len(ncellsList) == 1:
+    if len(levelsToExec) == 1:
         # We can't extract an observed order from one grid refinement.
         # Warn the user and exit.
-        print(f"Only one refinement level requested with ncells={ncellsList[0]}")
+        print(f"Only one refinement level requested with k={levelsToExec[0]}")
         print("So observed order calculation is not available.")
         return
     f = open(f"{caseDir}/observed-order-{caseDir}.dat", "w")
@@ -248,13 +261,15 @@ def assembleResults(case, ncellsList, norms):
         header += f"L1-{norm}  L2-{norm}  Linf-{norm} "
     header += "\n"
     f.write(header)
-    for k in range(len(ncellsList)-1,0,-1):
-        logr = log(dx[k+1]/dx[k])
+    for i in range(len(levelsToExec)-1):
+        kp1 = levelsToExec[i]
+        k = levelsToExec[i+1]
+        logr = log(dx[kp1]/dx[k])
         row = f"{dx[k]:20.12e} "
         for norm in norms:
-            pL1 = log(L1[k+1][norm]/L1[k][norm])/logr
-            pL2 = log(L2[k+1][norm]/L2[k][norm])/logr
-            pLinf = log(Linf[k+1][norm]/Linf[k][norm])/logr
+            pL1 = log(L1[kp1][norm]/L1[k][norm])/logr
+            pL2 = log(L2[kp1][norm]/L2[k][norm])/logr
+            pLinf = log(Linf[kp1][norm]/Linf[k][norm])/logr
             row += f"{pL1:20.12e} {pL2:20.12e} {pLinf:20.12e} "
         row += "\n"
         f.write(row)
